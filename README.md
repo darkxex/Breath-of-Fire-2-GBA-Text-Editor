@@ -14,7 +14,7 @@ BoF2Manager insert Breathesp.gba text.json breathpatced.gba bof2.gba.tbl
 
 - El método extraer te produce un json con: el texto, su puntero, el tamaño de linea en bytes y en caracteres.
 
-- El método parchar te reinsertar el json con la font, pantalla de título, y las modificaciones de texto realizadas en el json.
+- El método parchar te reinserta las modificaciones de texto realizadas en el json.
 
 <img width="500" height="166" alt="image" src="https://github.com/user-attachments/assets/9272795f-64b8-49ce-b95c-1e10724a9f4e" />
 
