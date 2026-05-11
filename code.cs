@@ -570,10 +570,6 @@ internal static class Program
 				}
 			}
 
-			if (char.IsWhiteSpace(current))
-			{
-				current = '_';
-			}
 
 			if (!TryEncodeLiteral(current, bytes))
 			{
@@ -764,22 +760,21 @@ internal static class Program
 		Dictionary<string, byte[]> map = new Dictionary<string, byte[]>(StringComparer.Ordinal);
 		foreach (string rawLine in File.ReadLines(resolvedPath, Encoding.UTF8))
 		{
-			string line = rawLine.Trim();
-			if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+			if (string.IsNullOrWhiteSpace(rawLine) || rawLine.TrimStart().StartsWith("#", StringComparison.Ordinal))
 			{
 				continue;
 			}
 
-			int equalsIndex = line.IndexOf('=');
+			int equalsIndex = rawLine.IndexOf('=');
 			if (equalsIndex <= 0)
 			{
 				continue;
 			}
 
-			string hexPart = line.Substring(0, equalsIndex).Trim();
-			string token = line.Substring(equalsIndex + 1).Trim();
+			string hexPart = rawLine.Substring(0, equalsIndex).Trim();
+			string token = rawLine.Substring(equalsIndex + 1);
 
-			if (hexPart.StartsWith("/", StringComparison.Ordinal))
+			if (hexPart.StartsWith("/", StringComparison.Ordinal) || hexPart.StartsWith("$", StringComparison.Ordinal))
 			{
 				hexPart = hexPart.Substring(1);
 			}
