@@ -1,2 +1,2 @@
-BoF2Manager extract Breathesp.gba text.json bof2.gba.tbl
+BoF2Manager extract br2worcharesp.gba text.json bof2_insertar.gba.tbl
 pause

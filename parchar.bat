@@ -1,2 +1,2 @@
-BoF2Manager insert bresp2.gba text.json breathpatced.gba bof2.gba.tbl
+BoF2Manager insert br2worcharesp.gba textoriginalesp.json breath_of_fire_2_patched.gba bof2_insertarSPA.gba.tbl
 pause
