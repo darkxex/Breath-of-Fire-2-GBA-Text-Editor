@@ -68,7 +68,6 @@ internal static class Program
 		byte[] rom = File.ReadAllBytes(inputPath);
 		List<ScriptEntry> entries = ParseRomScript(rom);
 		WriteEditableScript(outputPath, entries);
-		WriteExtractionMetadata(GetMetadataPath(outputPath), entries);
 
 		Console.WriteLine($"Extraído: {outputPath} ({entries.Count} bloques)");
 	}
@@ -87,9 +86,10 @@ internal static class Program
 			throw new FileNotFoundException($"No se encontró el ROM: {romPath}", romPath);
 		}
 
+		ExtractionMetadata metadata = LoadExtractionMetadata(scriptPath);
 		List<ScriptEntry> entries = ParseEditableScript(scriptPath);
 		byte[] rom = File.ReadAllBytes(romPath);
-		byte[] rebuiltRom = BuildPatchedRom(rom, entries);
+		byte[] rebuiltRom = BuildPatchedRom(rom, entries, metadata);
 
 		File.WriteAllBytes(outputRomPath, rebuiltRom);
 
@@ -108,13 +108,6 @@ internal static class Program
 		TokenToBytes = LoadTokenTable(tablePath);
 		LiteralMap = LoadLiteralMap(TokenToBytes);
 		DecodeTokens = LoadDecodeTokens(TokenToBytes);
-	}
-
-	private static string GetMetadataPath(string scriptPath)
-	{
-		string directory = Path.GetDirectoryName(Path.GetFullPath(scriptPath));
-		string fileName = Path.GetFileNameWithoutExtension(scriptPath) + DefaultMetadataExtension;
-		return Path.Combine(directory, fileName);
 	}
 
 	private static bool IsCommand(string value, string expected)
@@ -204,11 +197,16 @@ internal static class Program
 				List<ScriptEntry> entries = new List<ScriptEntry>(items.Count);
 				foreach (var it in items)
 				{
-					uint addr = uint.Parse(it.address, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+					uint addr = uint.Parse(it.pointerAddress, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
 					ScriptEntry e = new ScriptEntry(addr);
 					if (!string.IsNullOrEmpty(it.dialog))
 					{
 						e.Lines.Add(it.dialog);
+					}
+					// Preservar la dirección original si está en el JSON
+					if (!string.IsNullOrEmpty(it.stringAddress))
+					{
+						e.StringAddress = uint.Parse(it.stringAddress, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
 					}
 					entries.Add(e);
 				}
@@ -279,12 +277,16 @@ internal static class Program
 
 		if (string.Equals(Path.GetExtension(path), ".json", StringComparison.OrdinalIgnoreCase))
 		{
-			var items = entries.Select(e => new JsonScriptItem
+			var items = entries.Select(e => 
 			{
-				address = e.PointerAddress.ToString("X6", CultureInfo.InvariantCulture),
-				dialog = e.Text,
-				byteLength = e.ByteLength,
-				strLength = e.Text.Length
+				byte[] originalPayload = EncodeLogicalText(e.Text);
+				return new JsonScriptItem
+				{
+					dialog = e.Text,
+					pointerAddress = e.PointerAddress.ToString("X6", CultureInfo.InvariantCulture),
+					stringAddress = e.StringAddress.ToString("X6", CultureInfo.InvariantCulture),
+					originalByteLength = originalPayload.Length
+				};
 			}).ToList();
 			JsonSerializerOptions options = new JsonSerializerOptions 
 			{ 
@@ -343,11 +345,12 @@ internal static class Program
 		ExtractionMetadata metadata = new ExtractionMetadata();
 		foreach (ScriptEntry entry in entries)
 		{
+			byte[] originalPayload = EncodeLogicalText(entry.Text);
 			metadata.Entries.Add(new ExtractionEntry
 			{
 				PointerAddress = entry.PointerAddress,
 				StringAddress = entry.StringAddress,
-				OriginalText = entry.Text
+				OriginalByteLength = originalPayload.Length
 			});
 		}
 
@@ -359,24 +362,45 @@ internal static class Program
 		File.WriteAllText(path, JsonSerializer.Serialize(metadata, options), new UTF8Encoding(false));
 	}
 
-	private static ExtractionMetadata LoadExtractionMetadata(string path)
+	private static ExtractionMetadata LoadExtractionMetadata(string scriptPath)
 	{
-		if (!File.Exists(path))
+		if (!File.Exists(scriptPath))
 		{
-			throw new FileNotFoundException($"No se encontró el archivo de metadatos: {path}", path);
+			throw new FileNotFoundException($"No se encontró el archivo de script: {scriptPath}", scriptPath);
 		}
 
-		string json = File.ReadAllText(path, Encoding.UTF8);
-		ExtractionMetadata metadata = JsonSerializer.Deserialize<ExtractionMetadata>(json);
-		if (metadata == null || metadata.Entries == null)
+		if (!string.Equals(Path.GetExtension(scriptPath), ".json", StringComparison.OrdinalIgnoreCase))
 		{
-			throw new InvalidDataException($"No se pudo leer el archivo de metadatos: {path}");
+			throw new InvalidDataException($"Solo se soportan archivos JSON para cargar metadatos: {scriptPath}");
+		}
+
+		string json = File.ReadAllText(scriptPath, Encoding.UTF8);
+		var items = JsonSerializer.Deserialize<List<JsonScriptItem>>(json);
+		if (items == null)
+		{
+			throw new InvalidDataException($"No se pudo leer el archivo de script: {scriptPath}");
+		}
+
+		ExtractionMetadata metadata = new ExtractionMetadata();
+		foreach (var item in items)
+		{
+			int originalByteLength = item.originalByteLength;
+			
+			uint pointerAddress = string.IsNullOrEmpty(item.pointerAddress) ? 0 : uint.Parse(item.pointerAddress, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+			uint stringAddress = string.IsNullOrEmpty(item.stringAddress) ? 0 : uint.Parse(item.stringAddress, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+
+			metadata.Entries.Add(new ExtractionEntry
+			{
+				PointerAddress = pointerAddress,
+				StringAddress = stringAddress,
+				OriginalByteLength = originalByteLength
+			});
 		}
 
 		return metadata;
 	}
 
-	private static byte[] BuildPatchedRom(byte[] rom, IReadOnlyList<ScriptEntry> entries)
+	private static byte[] BuildPatchedRom(byte[] rom, IReadOnlyList<ScriptEntry> entries, ExtractionMetadata metadata)
 	{
 		int totalTableEntries = checked((int)((PointerTableStop - PointerTableStart) / PointerEntrySize));
 		if (entries.Count != totalTableEntries)
@@ -385,72 +409,115 @@ internal static class Program
 		}
 
 		byte[] output = (byte[])rom.Clone();
-		int scriptStart = checked((int)ScriptStart);
-		int pointerTableStart = checked((int)PointerTableStart);
-
-		int cursor = scriptStart;
 		int extensionCursor = -1;
 		Dictionary<string, uint> packedTextAddresses = new Dictionary<string, uint>(StringComparer.Ordinal);
+		
+		// Lista para rastrear huecos que queden vacíos para reutilizarlos (Reciclaje estilo Atlas)
+		var freeGaps = new List<(int Offset, int Size)>();
+		var pendingEntries = new List<ScriptEntry>();
 
+		// Ordenar offsets originales para calcular tamaños de huecos
+		var originalOffsets = metadata.Entries
+			.Where(e => e.StringAddress != 0)
+			.Select(e => e.StringAddress)
+			.Distinct()
+			.OrderBy(a => a)
+			.ToList();
+
+		// Fase 1: Intentar inserción en su lugar original
 		for (int i = 0; i < entries.Count; i++)
 		{
 			ScriptEntry entry = entries[i];
+			var meta = metadata.Entries.FirstOrDefault(m => m.PointerAddress == entry.PointerAddress);
 
-			// Si el texto está vacío, lo tratamos como un puntero nulo
 			if (string.IsNullOrEmpty(entry.Text))
 			{
 				entry.StringAddress = 0;
+				continue;
 			}
-			else if (packedTextAddresses.TryGetValue(entry.Text, out uint sharedAddress))
+
+			if (packedTextAddresses.TryGetValue(entry.Text, out uint sharedAddress))
 			{
 				entry.StringAddress = sharedAddress;
+				continue;
 			}
-			else
+
+			byte[] payload = EncodeLogicalText(entry.Text);
+			bool written = false;
+
+			if (meta != null && meta.StringAddress != 0)
 			{
-				byte[] payload = EncodeLogicalText(entry.Text);
-				int writeOffset;
-				if (cursor + payload.Length <= (int)PointerTableStart)
+				// Comparar con el tamaño original del texto
+				// Si el nuevo tamaño es igual o menor al original, escribir en el mismo lugar
+				if (payload.Length <= meta.OriginalByteLength)
 				{
-					writeOffset = cursor;
-					cursor = Align4(cursor + payload.Length);
+					Buffer.BlockCopy(payload, 0, output, (int)meta.StringAddress, payload.Length);
+					// Limpiar el resto del espacio original con 00
+					for (int k = payload.Length; k < meta.OriginalByteLength; k++) 
+						output[(int)meta.StringAddress + k] = 0x00;
+					
+					entry.StringAddress = meta.StringAddress;
+					packedTextAddresses[entry.Text] = entry.StringAddress;
+					written = true;
 				}
 				else
 				{
-					if (extensionCursor < 0)
-					{
-						extensionCursor = Align4(output.Length);
-					}
-
-					writeOffset = extensionCursor;
-					extensionCursor = Align4(writeOffset + payload.Length);
-					EnsureCapacity(ref output, extensionCursor);
+					// No cabe en su sitio original, guardar hueco para reciclaje
+					freeGaps.Add(((int)meta.StringAddress, meta.OriginalByteLength));
 				}
+			}
 
+			if (!written) pendingEntries.Add(entry);
+		}
+
+		// Fase 2: Reciclar huecos vacíos para las entradas que no cupieron (Smart Packing)
+		foreach (var entry in pendingEntries)
+		{
+			if (packedTextAddresses.TryGetValue(entry.Text, out uint sharedAddress))
+			{
+				entry.StringAddress = sharedAddress;
+				continue;
+			}
+
+			byte[] payload = EncodeLogicalText(entry.Text);
+			int recycledOffset = -1;
+
+			for (int g = 0; g < freeGaps.Count; g++)
+			{
+				if (payload.Length <= freeGaps[g].Size)
+				{
+					recycledOffset = freeGaps[g].Offset;
+					Buffer.BlockCopy(payload, 0, output, recycledOffset, payload.Length);
+					freeGaps.RemoveAt(g); 
+					break;
+				}
+			}
+
+			if (recycledOffset != -1)
+			{
+				entry.StringAddress = (uint)recycledOffset;
+				packedTextAddresses[entry.Text] = entry.StringAddress;
+			}
+			else
+			{
+				// Fase 3: Si no cabe ni en huecos reciclados, ir a la extensión al final
+				if (extensionCursor < 0) extensionCursor = (output.Length + 3) & ~3;
+
+				int writeOffset = extensionCursor;
+				extensionCursor += payload.Length; // Sin Align4 entre frases para ahorrar espacio
+				
+				EnsureCapacity(ref output, extensionCursor);
 				Buffer.BlockCopy(payload, 0, output, writeOffset, payload.Length);
+				
 				entry.StringAddress = (uint)writeOffset;
 				packedTextAddresses[entry.Text] = entry.StringAddress;
 			}
 		}
 
-		// Cálculo de estadísticas de espacio
-		int originalSpace = (int)(PointerTableStart - ScriptStart);
-		int usedOriginal = cursor - (int)ScriptStart;
-		int remainingOriginal = (int)PointerTableStart - cursor;
-		double percentUsed = (usedOriginal / (double)originalSpace) * 100.0;
-
-		Console.WriteLine("--------------------------------------------------");
-		Console.WriteLine($"Estadísticas de espacio (Bloque Original):");
-		Console.WriteLine($"  Usado:     {usedOriginal} / {originalSpace} bytes ({percentUsed:F2}%)");
-		if (remainingOriginal >= 0)
-			Console.WriteLine($"  Restante:  {remainingOriginal} bytes libres.");
-		else
-			Console.WriteLine($"  AVISO: El texto excedió el bloque original y se expandió al final de la ROM.");
-		Console.WriteLine("--------------------------------------------------");
-
+		// Fase 4: Actualizar Punteros
 		for (int i = 0; i < entries.Count; i++)
 		{
 			uint stringAddress = entries[i].StringAddress;
-
 			if (stringAddress != 0)
 			{
 				uint pointerValue = 0x08000000u + stringAddress;
@@ -458,7 +525,7 @@ internal static class Program
 				output[offset + 0] = (byte)(pointerValue & 0xFF);
 				output[offset + 1] = (byte)((pointerValue >> 8) & 0xFF);
 				output[offset + 2] = (byte)((pointerValue >> 16) & 0xFF);
-				// No tocamos el byte +3 para emular #W24 de Atlas y preservar flags si existen
+				// El byte +3 se preserva (flags del juego)
 			}
 		}
 
@@ -765,16 +832,6 @@ internal static class Program
 		return bytes.Count > 0 && bytes[bytes.Count - 1] == 0x00;
 	}
 
-	private static uint ParsePointerAddress(string line)
-	{
-		Match match = Regex.Match(line, @"^#W\d+\(\$([0-9A-Fa-f]+)\)");
-		if (!match.Success)
-		{
-			throw new InvalidDataException($"No se pudo leer la dirección de puntero: {line}");
-		}
-
-		return uint.Parse(match.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
-	}
 
 	private static uint ParseEditableAddress(string line)
 	{
@@ -967,14 +1024,17 @@ internal static class Program
 
 		public uint StringAddress { get; set; }
 
-		public string OriginalText { get; set; }
+		public int OriginalByteLength { get; set; }
 	}
 
 	private sealed class JsonScriptItem
 	{
-		public string address { get; set; }
+		public string pointerAddress { get; set; }
+		public string stringAddress { get; set; }
 		public string dialog { get; set; }
-		public int byteLength { get; set; }
-		public int strLength { get; set; }
+		
+		public int originalByteLength { get; set; }
+		
+		
 	}
 }
