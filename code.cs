@@ -138,14 +138,49 @@ internal static class Program
 
 			if (entry.StringAddress != 0)
 			{
-				entry.ByteLength = GetRawDialogByteLength(rom, entry.StringAddress);
-				entry.Lines.Add(DecodeRomText(rom, entry.StringAddress));
+				entry.ByteLength = 0;
 			}
 
 			entries.Add(entry);
 		}
 
+		List<uint> sortedStringAddresses = entries
+			.Where(e => e.StringAddress != 0)
+			.Select(e => e.StringAddress)
+			.Distinct()
+			.OrderBy(v => v)
+			.ToList();
+
+		foreach (ScriptEntry entry in entries)
+		{
+			if (entry.StringAddress == 0)
+			{
+				continue;
+			}
+
+			bool stopAtB0 = entry.PointerAddress == (PointerTableStop - (uint)PointerEntrySize);
+			int maxOffsetExclusive = GetStringDecodeLimit(entry.StringAddress, sortedStringAddresses, rom.Length);
+			entry.ByteLength = GetRawDialogByteLength(rom, entry.StringAddress, maxOffsetExclusive, stopAtB0);
+			entry.Lines.Clear();
+			entry.Lines.Add(DecodeRomText(rom, entry.StringAddress, maxOffsetExclusive, stopAtB0));
+		}
+
 		return entries;
+	}
+
+	private static int GetStringDecodeLimit(uint stringAddress, List<uint> sortedStringAddresses, int romLength)
+	{
+		for (int i = 0; i < sortedStringAddresses.Count; i++)
+		{
+			if (sortedStringAddresses[i] <= stringAddress)
+			{
+				continue;
+			}
+
+			return checked((int)sortedStringAddresses[i]);
+		}
+
+		return romLength;
 	}
 
 	private static List<ScriptEntry> ParseEditableScript(string path)
@@ -466,14 +501,15 @@ internal static class Program
 			| (rom[offset + 3] << 24));
 	}
 
-	private static string DecodeRomText(byte[] rom, uint stringAddress)
+	private static string DecodeRomText(byte[] rom, uint stringAddress, int maxOffsetExclusive, bool stopAtB0)
 	{
 		int offset = checked((int)stringAddress);
 		StringBuilder builder = new StringBuilder();
+		int maxOffset = Math.Min(maxOffsetExclusive, rom.Length);
 
-		while (offset < rom.Length)
+		while (offset < maxOffset)
 		{
-			if (rom[offset] == 0x00)
+			if (stopAtB0 && rom[offset] == 0xB0)
 			{
 				break;
 			}
@@ -481,7 +517,7 @@ internal static class Program
 			bool matched = false;
 			foreach (TokenDefinition token in DecodeTokens)
 			{
-				if (token.Bytes.Length == 0 || offset + token.Bytes.Length > rom.Length)
+				if (token.Bytes.Length == 0 || offset + token.Bytes.Length > maxOffset)
 				{
 					continue;
 				}
@@ -497,6 +533,13 @@ internal static class Program
 
 			if (!matched)
 			{
+				if (rom[offset] == 0x00)
+				{
+					builder.Append("<$00>");
+					offset++;
+					continue;
+				}
+
 				builder.Append("[$");
 				builder.Append(rom[offset].ToString("X2", CultureInfo.InvariantCulture));
 				builder.Append("]");
@@ -507,16 +550,22 @@ internal static class Program
 		return builder.ToString();
 	}
 
-	private static int GetRawDialogByteLength(byte[] rom, uint stringAddress)
+	private static int GetRawDialogByteLength(byte[] rom, uint stringAddress, int maxOffsetExclusive, bool stopAtB0)
 	{
-		int offset = checked((int)stringAddress);
-		if (offset < 0 || offset >= rom.Length)
+		int start = checked((int)stringAddress);
+		if (start < 0 || start >= rom.Length)
 		{
 			return 0;
 		}
 
-		int start = offset;
-		while (offset < rom.Length && rom[offset] != 0x00)
+		int maxOffset = Math.Min(maxOffsetExclusive, rom.Length);
+		if (!stopAtB0)
+		{
+			return Math.Max(0, maxOffset - start);
+		}
+
+		int offset = start;
+		while (offset < maxOffset && rom[offset] != 0xB0)
 		{
 			offset++;
 		}
@@ -553,6 +602,16 @@ internal static class Program
 			if (current == '\r' || current == '\n')
 			{
 				continue;
+			}
+
+			if (current == '\\' && i + 1 < text.Length)
+			{
+				char escaped = text[i + 1];
+				if (escaped == 'n' || escaped == 'r')
+				{
+					i++;
+					continue;
+				}
 			}
 
 			if (current == '[' || current == '<')
@@ -618,7 +677,7 @@ internal static class Program
 			}
 		}
 
-		if (TokenToBytes.TryGetValue(token, out byte[] bytes))
+		if (TryGetTokenBytes(token, out byte[] bytes))
 		{
 			output.AddRange(bytes);
 			return true;
@@ -635,6 +694,34 @@ internal static class Program
 				output.Add(byte.Parse(hex.Substring(i, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture));
 			return true;
 		}
+		return false;
+	}
+
+	private static bool TryGetTokenBytes(string token, out byte[] bytes)
+	{
+		if (TokenToBytes.TryGetValue(token, out bytes))
+		{
+			return true;
+		}
+
+		string[] variants = new[]
+		{
+			token + "\\n",
+			token + "\\n\\n",
+			token + "\\r",
+			token + "\\r\\n",
+			token + "\\r\\n\\r\\n"
+		};
+
+		foreach (string variant in variants)
+		{
+			if (TokenToBytes.TryGetValue(variant, out bytes))
+			{
+				return true;
+			}
+		}
+
+		bytes = null;
 		return false;
 	}
 
