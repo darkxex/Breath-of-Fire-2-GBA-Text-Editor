@@ -624,17 +624,17 @@ internal static class Program
 			return true;
 		}
 
-		string hex = token.StartsWith("$", StringComparison.Ordinal) ? token.Substring(1) : token;
+		string inner = token;
+		if (inner.Length >= 2 && (inner[0] == '[' || inner[0] == '<'))
+			inner = inner.Substring(1, inner.Length - 2); // quita el bracket de apertura y cierre
+
+		string hex = inner.StartsWith("$", StringComparison.Ordinal) ? inner.Substring(1) : inner;
 		if (hex.Length > 0 && hex.Length % 2 == 0 && hex.All(IsHexDigit))
 		{
 			for (int i = 0; i < hex.Length; i += 2)
-			{
 				output.Add(byte.Parse(hex.Substring(i, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture));
-			}
-
 			return true;
 		}
-
 		return false;
 	}
 
