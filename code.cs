@@ -10,18 +10,14 @@ using System.Text.Encodings.Web;
 
 internal static class Program
 {
-	private const uint ScriptStart = 0x13EBB0;
 	private const uint PointerTableStart = 0x1895B4;
 	private const uint PointerTableStop = 0x18D5B4;
-	private const uint SpecialStopAtFirstTerminatorPointer = 0x18D5B0;
 	private const int PointerEntrySize = 4;
 
 	private const string DefaultRomFile = "Breath of Fire II (Europe).gba";
 	private const string DefaultEditableScript = "script_bof2.json";
 	private const string DefaultPatchedRom = "Breath of Fire II (Europe)_patched.gba";
 	private const string DefaultTableFile = "bof2.gba.tbl";
-	// private const string DefaultRebuiltScript = "BOF2_script_recalculated.txt";
-	private const string DefaultMetadataExtension = ".meta.json";
 
 	private static Dictionary<string, byte[]> TokenToBytes = new Dictionary<string, byte[]>(StringComparer.Ordinal);
 	private static Dictionary<char, byte[]> LiteralMap = new Dictionary<char, byte[]>();
@@ -158,14 +154,11 @@ internal static class Program
 				continue;
 			}
 
-			bool stopAtFirstTerminator = entry.PointerAddress == SpecialStopAtFirstTerminatorPointer;
-			int finalMaxOffset = stopAtFirstTerminator
-				? rom.Length
-				: GetDialogLogicalEnd(rom, entry.StringAddress, sortedStringAddresses);
-			int totalByteLength = GetRawDialogByteLength(rom, entry.StringAddress, finalMaxOffset, stopAtFirstTerminator);
+			int finalMaxOffset = GetDialogLogicalEnd(rom, entry.StringAddress, sortedStringAddresses);
+			int totalByteLength = GetRawDialogByteLength(rom, entry.StringAddress, finalMaxOffset);
 			entry.ByteLength = totalByteLength;
 			entry.Lines.Clear();
-			entry.Lines.Add(DecodeRomText(rom, entry.StringAddress, finalMaxOffset, stopAtFirstTerminator));
+			entry.Lines.Add(DecodeRomText(rom, entry.StringAddress, finalMaxOffset));
 		}
 
 		RepairEmptySplitDialogEntries(rom, entries, sortedStringAddresses);
@@ -196,8 +189,8 @@ internal static class Program
 			}
 
 		entry.Lines.Clear();
-			entry.Lines.Add(DecodeRomText(rom, entry.StringAddress, endOffset, entry.PointerAddress == SpecialStopAtFirstTerminatorPointer));
-			entry.ByteLength = GetRawDialogByteLength(rom, entry.StringAddress, endOffset, entry.PointerAddress == SpecialStopAtFirstTerminatorPointer);
+			entry.Lines.Add(DecodeRomText(rom, entry.StringAddress, endOffset));
+			entry.ByteLength = GetRawDialogByteLength(rom, entry.StringAddress, endOffset);
 			entry.IsRecovered = true; // Marcar como recuperado
 		}
 	}
@@ -208,6 +201,11 @@ internal static class Program
 		if (index < 0)
 		{
 			return rom.Length;
+		}
+
+		if (index == sortedStringAddresses.Count - 1)
+		{
+			return 0x1895B2; // El final lógico de los diálogos es antes de la tabla de punteros (0x1895B4)
 		}
 
 		for (int i = index + 1; i < sortedStringAddresses.Count; i++)
@@ -239,7 +237,7 @@ internal static class Program
 			return checked((int)sortedStringAddresses[i]);
 		}
 
-		return romLength;
+		return 0x1895B2; // El final lógico de los diálogos es antes de la tabla de punteros (0x1895B4)
 	}
 
 	private static List<ScriptEntry> ParseEditableScript(string path)
@@ -387,47 +385,6 @@ internal static class Program
 		}
 
 		File.WriteAllText(path, builder.ToString(), new UTF8Encoding(false));
-	}
-
-	private static void WriteRebuiltScript(string path, IReadOnlyList<ScriptEntry> entries)
-	{
-		EnsureDirectoryForFile(path);
-
-		StringBuilder builder = new StringBuilder();
-		foreach (ScriptEntry entry in entries)
-		{
-			builder.Append("[ADDR:");
-			builder.Append(entry.PointerAddress.ToString("X6", CultureInfo.InvariantCulture));
-			builder.Append("]|");
-			builder.AppendLine(entry.Text);
-		}
-
-		File.WriteAllText(path, builder.ToString(), new UTF8Encoding(false));
-	}
-
-	private static void WriteExtractionMetadata(string path, IReadOnlyList<ScriptEntry> entries)
-	{
-		EnsureDirectoryForFile(path);
-
-		ExtractionMetadata metadata = new ExtractionMetadata();
-		foreach (ScriptEntry entry in entries)
-		{
-			byte[] originalPayload = EncodeLogicalText(entry.Text);
-			metadata.Entries.Add(new ExtractionEntry
-			{
-				PointerAddress = entry.PointerAddress,
-				StringAddress = entry.StringAddress,
-				OriginalByteLength = originalPayload.Length,
-				Recovered = entry.IsRecovered
-			});
-		}
-
-		JsonSerializerOptions options = new JsonSerializerOptions 
-		{ 
-			WriteIndented = true,
-			Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
-		};
-		File.WriteAllText(path, JsonSerializer.Serialize(metadata, options), new UTF8Encoding(false));
 	}
 
 	private static ExtractionMetadata LoadExtractionMetadata(string scriptPath)
@@ -653,11 +610,6 @@ internal static class Program
 		}
 	}
 
-	private static int Align4(int value)
-	{
-		return (value + 3) & ~3;
-	}
-
 	private static void EnsureCapacity(ref byte[] buffer, int minLength)
 	{
 		if (minLength <= buffer.Length)
@@ -689,7 +641,7 @@ internal static class Program
 			| (rom[offset + 3] << 24));
 	}
 
-	private static string DecodeRomText(byte[] rom, uint stringAddress, int maxOffsetExclusive, bool stopAtB0)
+	private static string DecodeRomText(byte[] rom, uint stringAddress, int maxOffsetExclusive)
 	{
 		int offset = checked((int)stringAddress);
 		StringBuilder builder = new StringBuilder();
@@ -697,10 +649,6 @@ internal static class Program
 
 		while (offset < maxOffset)
 		{
-			if (stopAtB0 && rom[offset] == 0xB0)
-			{
-				break;
-			}
 
 			bool matched = false;
 			foreach (TokenDefinition token in DecodeTokens)
@@ -715,6 +663,11 @@ internal static class Program
 					builder.Append(FormatDecodedToken(token));
 					offset += token.Bytes.Length;
 					matched = true;
+
+					if (token.Bytes.Length == 1 && token.Bytes[0] == 0x00)
+					{
+						return builder.ToString();
+					}
 					break;
 				}
 			}
@@ -724,8 +677,7 @@ internal static class Program
 				if (rom[offset] == 0x00)
 				{
 					builder.Append("<$00>");
-					offset++;
-					continue;
+					return builder.ToString();
 				}
 
 				builder.Append("[$");
@@ -738,7 +690,7 @@ internal static class Program
 		return builder.ToString();
 	}
 
-	private static int GetRawDialogByteLength(byte[] rom, uint stringAddress, int maxOffsetExclusive, bool stopAtB0)
+	private static int GetRawDialogByteLength(byte[] rom, uint stringAddress, int maxOffsetExclusive)
 	{
 		int start = checked((int)stringAddress);
 		if (start < 0 || start >= rom.Length)
@@ -747,14 +699,14 @@ internal static class Program
 		}
 
 		int maxOffset = Math.Min(maxOffsetExclusive, rom.Length);
-		if (!stopAtB0)
-		{
-			return Math.Max(0, maxOffset - start);
-		}
-
 		int offset = start;
-		while (offset < maxOffset && rom[offset] != 0xB0)
+		while (offset < maxOffset)
 		{
+			if (rom[offset] == 0x00)
+			{
+				offset++;
+				break;
+			}
 			offset++;
 		}
 
