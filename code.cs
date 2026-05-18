@@ -13,6 +13,7 @@ internal static class Program
 	private const uint ScriptStart = 0x13EBB0;
 	private const uint PointerTableStart = 0x1895B4;
 	private const uint PointerTableStop = 0x18D5B4;
+	private const uint SpecialStopAtFirstTerminatorPointer = 0x18D5B0;
 	private const int PointerEntrySize = 4;
 
 	private const string DefaultRomFile = "Breath of Fire II (Europe).gba";
@@ -151,14 +152,79 @@ internal static class Program
 				continue;
 			}
 
-			bool stopAtB0 = entry.PointerAddress == (PointerTableStop - (uint)PointerEntrySize);
-			int maxOffsetExclusive = GetStringDecodeLimit(entry.StringAddress, sortedStringAddresses, rom.Length);
-			entry.ByteLength = GetRawDialogByteLength(rom, entry.StringAddress, maxOffsetExclusive, stopAtB0);
+			int startPos = checked((int)entry.StringAddress);
+			if (startPos > 0 && rom[startPos - 1] != 0x00)
+			{
+				continue;
+			}
+
+			bool stopAtFirstTerminator = entry.PointerAddress == SpecialStopAtFirstTerminatorPointer;
+			int finalMaxOffset = stopAtFirstTerminator
+				? rom.Length
+				: GetDialogLogicalEnd(rom, entry.StringAddress, sortedStringAddresses);
+			int totalByteLength = GetRawDialogByteLength(rom, entry.StringAddress, finalMaxOffset, stopAtFirstTerminator);
+			entry.ByteLength = totalByteLength;
 			entry.Lines.Clear();
-			entry.Lines.Add(DecodeRomText(rom, entry.StringAddress, maxOffsetExclusive, stopAtB0));
+			entry.Lines.Add(DecodeRomText(rom, entry.StringAddress, finalMaxOffset, stopAtFirstTerminator));
 		}
 
+		RepairEmptySplitDialogEntries(rom, entries, sortedStringAddresses);
+
 		return entries;
+	}
+
+	private static void RepairEmptySplitDialogEntries(byte[] rom, List<ScriptEntry> entries, List<uint> sortedStringAddresses)
+	{
+		// Only recover text for entries that were extracted as empty (no lines)
+		// Do NOT modify neighbouring entries or change the logical end detection.
+		for (int i = 0; i < entries.Count; i++)
+		{
+			ScriptEntry entry = entries[i];
+			if (entry.StringAddress == 0)
+				continue;
+
+			if (entry.Lines.Count > 0)
+				continue; // only act on truly empty extractions
+
+			// Find next sorted start to determine the available bytes for this string
+			int nextStart = GetStringDecodeLimit(entry.StringAddress, sortedStringAddresses, rom.Length);
+
+			int endOffset = Math.Min(nextStart, rom.Length);
+			if (endOffset <= 0 || endOffset <= entry.StringAddress)
+			{
+				continue;
+			}
+
+		entry.Lines.Clear();
+			entry.Lines.Add(DecodeRomText(rom, entry.StringAddress, endOffset, entry.PointerAddress == SpecialStopAtFirstTerminatorPointer));
+			entry.ByteLength = GetRawDialogByteLength(rom, entry.StringAddress, endOffset, entry.PointerAddress == SpecialStopAtFirstTerminatorPointer);
+			entry.IsRecovered = true; // Marcar como recuperado
+		}
+	}
+
+	private static int GetDialogLogicalEnd(byte[] rom, uint dialogStart, List<uint> sortedStringAddresses)
+	{
+		int index = sortedStringAddresses.IndexOf(dialogStart);
+		if (index < 0)
+		{
+			return rom.Length;
+		}
+
+		for (int i = index + 1; i < sortedStringAddresses.Count; i++)
+		{
+			int nextStart = checked((int)sortedStringAddresses[i]);
+			if (nextStart <= 0 || nextStart > rom.Length)
+			{
+				return rom.Length;
+			}
+
+			if (rom[nextStart - 1] == 0x00)
+			{
+				return nextStart;
+			}
+		}
+
+		return rom.Length;
 	}
 
 	private static int GetStringDecodeLimit(uint stringAddress, List<uint> sortedStringAddresses, int romLength)
@@ -285,7 +351,8 @@ internal static class Program
 					dialog = e.Text,
 					pointerAddress = e.PointerAddress.ToString("X6", CultureInfo.InvariantCulture),
 					stringAddress = e.StringAddress.ToString("X6", CultureInfo.InvariantCulture),
-					originalByteLength = originalPayload.Length
+					originalByteLength = originalPayload.Length,
+					recovered = e.IsRecovered
 				};
 			}).ToList();
 			JsonSerializerOptions options = new JsonSerializerOptions 
@@ -350,7 +417,8 @@ internal static class Program
 			{
 				PointerAddress = entry.PointerAddress,
 				StringAddress = entry.StringAddress,
-				OriginalByteLength = originalPayload.Length
+				OriginalByteLength = originalPayload.Length,
+				Recovered = entry.IsRecovered
 			});
 		}
 
@@ -393,7 +461,8 @@ internal static class Program
 			{
 				PointerAddress = pointerAddress,
 				StringAddress = stringAddress,
-				OriginalByteLength = originalByteLength
+				OriginalByteLength = originalByteLength,
+				Recovered = item.recovered
 			});
 		}
 
@@ -409,22 +478,30 @@ internal static class Program
 		}
 
 		byte[] output = (byte[])rom.Clone();
-		int extensionCursor = -1;
-		Dictionary<string, uint> packedTextAddresses = new Dictionary<string, uint>(StringComparer.Ordinal);
-		
-		// Lista para rastrear huecos que queden vacíos para reutilizarlos (Reciclaje estilo Atlas)
+		var packedTextAddresses = new Dictionary<string, uint>(StringComparer.Ordinal);
 		var freeGaps = new List<(int Offset, int Size)>();
 		var pendingEntries = new List<ScriptEntry>();
 
-		// Ordenar offsets originales para calcular tamaños de huecos
-		var originalOffsets = metadata.Entries
-			.Where(e => e.StringAddress != 0)
-			.Select(e => e.StringAddress)
-			.Distinct()
-			.OrderBy(a => a)
-			.ToList();
+		// Fase 1: Intenta ajustar cada diálogo en su ubicación original en ROM
+		InsertPhase1_OriginalLocations(entries, metadata, ref output, packedTextAddresses, freeGaps, pendingEntries);
 
-		// Fase 1: Intentar inserción en su lugar original
+		// Fase 2: Recicla espacios vacíos de diálogos anteriores que fueron comprimidos
+		InsertPhase2_RecycleGaps(pendingEntries, ref output, packedTextAddresses, freeGaps);
+
+		// Fase 3: Escribe el resto de diálogos al final de la ROM (con extensión de ROM si es necesario)
+		int extensionCursor = -1;
+		InsertPhase3_RomExtension(pendingEntries, ref output, packedTextAddresses, ref extensionCursor);
+
+		// Fase 4: Actualiza la tabla de punteros con las nuevas direcciones
+		InsertPhase4_UpdatePointerTable(entries, output);
+
+		return output;
+	}
+
+	private static void InsertPhase1_OriginalLocations(IReadOnlyList<ScriptEntry> entries, ExtractionMetadata metadata, ref byte[] output,
+		Dictionary<string, uint> packedTextAddresses, List<(int Offset, int Size)> freeGaps, List<ScriptEntry> pendingEntries)
+	{
+		// Intenta escribir cada diálogo en su ubicación original si el nuevo texto cabe
 		for (int i = 0; i < entries.Count; i++)
 		{
 			ScriptEntry entry = entries[i];
@@ -436,6 +513,61 @@ internal static class Program
 				continue;
 			}
 
+			// Si el texto es idéntico a uno anterior, reutilizar su dirección
+			if (packedTextAddresses.TryGetValue(entry.Text, out uint sharedAddress))
+			{
+				entry.StringAddress = sharedAddress;
+				continue;
+			}
+
+			// Los diálogos recuperados van directamente a Fase 3 para evitar solapamientos con el diálogo padre
+			if (meta != null && meta.Recovered)
+			{
+				pendingEntries.Add(entry);
+				continue;
+			}
+
+			byte[] payload = EncodeLogicalText(entry.Text);
+			bool written = false;
+
+			// Si el diálogo original tenía una ubicación conocida
+			if (meta != null && meta.StringAddress != 0)
+			{
+				// Si el nuevo texto cabe en el espacio original, escribirlo ahí
+				if (payload.Length <= meta.OriginalByteLength)
+				{
+					Buffer.BlockCopy(payload, 0, output, (int)meta.StringAddress, payload.Length);
+					// Limpiar el resto del espacio original con bytes 0x00
+					for (int k = payload.Length; k < meta.OriginalByteLength; k++)
+						output[(int)meta.StringAddress + k] = 0x00;
+
+					entry.StringAddress = meta.StringAddress;
+					packedTextAddresses[entry.Text] = entry.StringAddress;
+					written = true;
+				}
+				else
+				{
+					// Si no cabe, registrar el hueco para reutilizarlo más adelante (Fase 2)
+					freeGaps.Add(((int)meta.StringAddress, meta.OriginalByteLength));
+				}
+			}
+
+			if (!written)
+			{
+				pendingEntries.Add(entry);
+			}
+		}
+	}
+
+	private static void InsertPhase2_RecycleGaps(List<ScriptEntry> pendingEntries, ref byte[] output,
+		Dictionary<string, uint> packedTextAddresses, List<(int Offset, int Size)> freeGaps)
+	{
+		// Intenta ajustar los diálogos que no cupieron (Phase 1) en los huecos vacíos
+		var remainingEntries = new List<ScriptEntry>();
+
+		foreach (var entry in pendingEntries)
+		{
+			// Si ya está en el diccionario de direcciones (fue plegado), continuar
 			if (packedTextAddresses.TryGetValue(entry.Text, out uint sharedAddress))
 			{
 				entry.StringAddress = sharedAddress;
@@ -443,34 +575,38 @@ internal static class Program
 			}
 
 			byte[] payload = EncodeLogicalText(entry.Text);
-			bool written = false;
+			bool placed = false;
 
-			if (meta != null && meta.StringAddress != 0)
+			// Buscar un hueco suficientemente grande para este diálogo
+			for (int g = 0; g < freeGaps.Count; g++)
 			{
-				// Comparar con el tamaño original del texto
-				// Si el nuevo tamaño es igual o menor al original, escribir en el mismo lugar
-				if (payload.Length <= meta.OriginalByteLength)
+				if (payload.Length <= freeGaps[g].Size)
 				{
-					Buffer.BlockCopy(payload, 0, output, (int)meta.StringAddress, payload.Length);
-					// Limpiar el resto del espacio original con 00
-					for (int k = payload.Length; k < meta.OriginalByteLength; k++) 
-						output[(int)meta.StringAddress + k] = 0x00;
-					
-					entry.StringAddress = meta.StringAddress;
+					int recycledOffset = freeGaps[g].Offset;
+					Buffer.BlockCopy(payload, 0, output, recycledOffset, payload.Length);
+					entry.StringAddress = (uint)recycledOffset;
 					packedTextAddresses[entry.Text] = entry.StringAddress;
-					written = true;
-				}
-				else
-				{
-					// No cabe en su sitio original, guardar hueco para reciclaje
-					freeGaps.Add(((int)meta.StringAddress, meta.OriginalByteLength));
+					freeGaps.RemoveAt(g);
+					placed = true;
+					break;
 				}
 			}
 
-			if (!written) pendingEntries.Add(entry);
+			if (!placed)
+			{
+				remainingEntries.Add(entry);
+			}
 		}
 
-		// Fase 2: Reciclar huecos vacíos para las entradas que no cupieron (Smart Packing)
+		// Los que no pudieron colocarse aquí irán a Fase 3
+		pendingEntries.Clear();
+		pendingEntries.AddRange(remainingEntries);
+	}
+
+	private static void InsertPhase3_RomExtension(List<ScriptEntry> pendingEntries, ref byte[] output,
+		Dictionary<string, uint> packedTextAddresses, ref int extensionCursor)
+	{
+		// Los diálogos que no cupieron en ubicaciones anteriores se escriben al final (extensión de ROM)
 		foreach (var entry in pendingEntries)
 		{
 			if (packedTextAddresses.TryGetValue(entry.Text, out uint sharedAddress))
@@ -480,56 +616,41 @@ internal static class Program
 			}
 
 			byte[] payload = EncodeLogicalText(entry.Text);
-			int recycledOffset = -1;
 
-			for (int g = 0; g < freeGaps.Count; g++)
+			// Inicializar el cursor de extensión si es la primera escritura aquí
+			if (extensionCursor < 0)
 			{
-				if (payload.Length <= freeGaps[g].Size)
-				{
-					recycledOffset = freeGaps[g].Offset;
-					Buffer.BlockCopy(payload, 0, output, recycledOffset, payload.Length);
-					freeGaps.RemoveAt(g); 
-					break;
-				}
+				extensionCursor = (output.Length + 3) & ~3; // Alineación de 4 bytes
 			}
 
-			if (recycledOffset != -1)
-			{
-				entry.StringAddress = (uint)recycledOffset;
-				packedTextAddresses[entry.Text] = entry.StringAddress;
-			}
-			else
-			{
-				// Fase 3: Si no cabe ni en huecos reciclados, ir a la extensión al final
-				if (extensionCursor < 0) extensionCursor = (output.Length + 3) & ~3;
+			int writeOffset = extensionCursor;
+			extensionCursor += payload.Length;
 
-				int writeOffset = extensionCursor;
-				extensionCursor += payload.Length; // Sin Align4 entre frases para ahorrar espacio
-				
-				EnsureCapacity(ref output, extensionCursor);
-				Buffer.BlockCopy(payload, 0, output, writeOffset, payload.Length);
-				
-				entry.StringAddress = (uint)writeOffset;
-				packedTextAddresses[entry.Text] = entry.StringAddress;
-			}
+			EnsureCapacity(ref output, extensionCursor);
+			Buffer.BlockCopy(payload, 0, output, writeOffset, payload.Length);
+
+			entry.StringAddress = (uint)writeOffset;
+			packedTextAddresses[entry.Text] = entry.StringAddress;
 		}
+	}
 
-		// Fase 4: Actualizar Punteros
+	private static void InsertPhase4_UpdatePointerTable(IReadOnlyList<ScriptEntry> entries, byte[] output)
+	{
+		// Actualiza la tabla de punteros (en 0x1895B4) con las nuevas direcciones de texto
 		for (int i = 0; i < entries.Count; i++)
 		{
 			uint stringAddress = entries[i].StringAddress;
 			if (stringAddress != 0)
 			{
-				uint pointerValue = 0x08000000u + stringAddress;
-				int offset = checked((int)entries[i].PointerAddress);
-				output[offset + 0] = (byte)(pointerValue & 0xFF);
-				output[offset + 1] = (byte)((pointerValue >> 8) & 0xFF);
-				output[offset + 2] = (byte)((pointerValue >> 16) & 0xFF);
-				// El byte +3 se preserva (flags del juego)
+				uint pointerValue = 0x08000000u + stringAddress; // Dirección física (suma el offset de BIOS)
+				int pointerTableOffset = checked((int)entries[i].PointerAddress);
+
+				// Escribir 3 bytes de dirección (el 4to byte es flag del juego)
+				output[pointerTableOffset + 0] = (byte)(pointerValue & 0xFF);
+				output[pointerTableOffset + 1] = (byte)((pointerValue >> 8) & 0xFF);
+				output[pointerTableOffset + 2] = (byte)((pointerValue >> 16) & 0xFF);
 			}
 		}
-
-		return output;
 	}
 
 	private static int Align4(int value)
@@ -992,6 +1113,8 @@ internal static class Program
 
 		public int ByteLength { get; set; }
 
+		public bool IsRecovered { get; set; }
+
 		public List<string> Lines { get; } = new List<string>();
 
 		public string Text
@@ -1025,6 +1148,8 @@ internal static class Program
 		public uint StringAddress { get; set; }
 
 		public int OriginalByteLength { get; set; }
+
+		public bool Recovered { get; set; }
 	}
 
 	private sealed class JsonScriptItem
@@ -1034,7 +1159,6 @@ internal static class Program
 		public string dialog { get; set; }
 		
 		public int originalByteLength { get; set; }
-		
-		
+		public bool recovered { get; set; }
 	}
 }
